@@ -2,7 +2,99 @@ import torch
 import torch.nn.functional as fc
 from torch import nn, Tensor
 from typing import Optional
-from torch.utils.tensorboard import SummaryWriter
+from torch.utils.tensorboard.writer import SummaryWriter
+
+class RoPE_Emb(nn.Module):
+    """RoPE位置编码"""
+    def __init__(self, d: int, max_len: int=4096, device: str | None=None):
+        """
+        RoPE位置编码, Tower2 技术下放(doge)
+        - d: 模型维度
+        - max_len: 最大序列长度
+        """
+        super().__init__()
+
+        self.d = d
+        self.max_len = max_len
+        self.device = device
+
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, d, 2).float().to(device) / d))
+        # 计算频率
+
+        self.register_buffer('inv_freq', inv_freq, persistent=False)
+        # 注册频率
+
+        self._get_embedding(inv_freq)
+        # 预计算
+
+    def _get_embedding(self, inv_freq):
+        """预计算位置编码"""
+        len_ids = torch.arange(self.max_len, device=self.device)
+        # 序列索引
+
+        freqs = torch.outer(len_ids, inv_freq)
+        # 计算频率
+
+        emb = torch.cat((freqs, freqs), dim=-1)
+        # 复制频率参数, 使复数对共享相同的频率
+
+        self.register_buffer("cos_cached", emb.cos(), persistent=False)
+        self.register_buffer("sin_cached", emb.sin(), persistent=False)
+        # 频率缓存
+
+    def forward(self) -> tuple:
+        """
+        生成RoPE位置编码
+        """
+
+        self.cos_cached: Tensor
+        self.sin_cached: Tensor
+
+        return (
+            self.cos_cached,
+            self.sin_cached,
+        )
+
+def RoPE_rotate(x: Tensor) -> Tensor:
+    """
+    RoPE旋转操作
+    - x: 输入张量
+    """
+    x1 = x[..., : x.shape[-1] // 2]   # 取前一半维度
+    x2 = x[..., x.shape[-1] // 2 :]   # 取后一半维度
+    return torch.cat((-x2, x1), dim=-1)   # 拼接
+
+def RoPE_reshape(x: Tensor) -> Tensor:
+    """重塑张量形状"""
+    batch, head_num, seq_len, dim = x.shape
+    x = x.view(batch, head_num, seq_len, dim//2, 2).transpose(4, 3).reshape(batch, head_num, seq_len, dim)
+
+    return x
+
+def RoPE_apply(q: Tensor, k: Tensor, cos: Tensor, sin: Tensor, pos_ids: Tensor):
+    """
+    应用RoPE编码
+    - q: query
+    - k: key
+    - cos: RoPE cos
+    - sin: RoPE sin
+    - pos_ids: 位置索引
+    """
+    cos = cos[pos_ids].unsqueeze(0).unsqueeze(0)   # 按位置索引选择cos值
+    sin = sin[pos_ids].unsqueeze(0).unsqueeze(0)   # 按位置索引选择sin值
+
+    q = RoPE_reshape(q)
+    # 重塑 Query
+
+    k = RoPE_reshape(k)
+    # 重塑 Key
+
+    q_embed = (q * cos) + (RoPE_rotate(q) * sin)
+    k_embed = (k * cos) + (RoPE_rotate(k) * sin)
+    # 应用旋转位置编码
+
+    return q_embed, k_embed
+
 
 class Multi_Self_Attn(nn.Module):
     """多头自注意力层"""
@@ -19,16 +111,22 @@ class Multi_Self_Attn(nn.Module):
         self.dk = dk
         self.use_dropout = use_dropout
 
-        self.q_proj = nn.Linear(d, head_num * dk)
-        self.k_proj = nn.Linear(d, head_num * dk)
-        self.v_proj = nn.Linear(d, head_num * dk)
-        self.o_proj = nn.Linear(head_num * dk, d)
-        # 合并所有头的投影矩阵
+        self.q_proj = nn.Linear(d, head_num * dk, bias=False)
+        self.k_proj = nn.Linear(d, head_num * dk, bias=False)
+        self.v_proj = nn.Linear(d, head_num * dk, bias=False)
+        self.o_proj = nn.Linear(head_num * dk, d, bias=False)
+        # 初始化投影层
 
-    def forward(self, x: Tensor, mask: Optional[Tensor] = None) -> Tensor:
+        self.rope = RoPE_Emb(dk, max_len=4096, device='cuda' if torch.cuda.is_available() else 'cpu')
+        # 初始化 RoPE
+
+    def forward(self, x: Tensor, mask: Tensor | None = None) -> Tensor:
         batch_size, seq_len, _ = x.size()
 
-        Q: Tensor = self.q_proj(x)  
+        pos_ids = torch.arange(seq_len, device=x.device)
+        # 生成位置索引 [seq_len]
+
+        Q: Tensor = self.q_proj(x)
         K: Tensor = self.k_proj(x)
         V: Tensor = self.v_proj(x)
         # 并行投影, 方便并行计算
@@ -37,6 +135,9 @@ class Multi_Self_Attn(nn.Module):
         K = K.view(batch_size, seq_len, self.head_num, self.dk).transpose(1, 2)
         V = V.view(batch_size, seq_len, self.head_num, self.dk).transpose(1, 2)
         # 分成多个注意力头 [batch, seq_len, head_num, dk]
+
+        cos, sin = self.rope()
+        Q, K = RoPE_apply(Q, K, cos, sin, pos_ids)
 
         attn_output = fc.scaled_dot_product_attention(Q, K, V,
             dropout_p=0.05 if self.use_dropout else 0,
@@ -140,28 +241,10 @@ class ViT_Transformer(nn.Module):
 
         self.encoders = nn.Sequential()   # 模块容器
         for _ in range(encoder_num):
-            self.encoders.append(self.encoder.to(device))
-            # 添加encoder_num个编码器
-
-    def rope_encode(self, len:int):   # RoPE位置编码
-        """本项目的RoPE是外挂而非嵌入, 嵌入太麻烦了, 我懒()"""
-        seq_len = len   # 获得输入序列长度
-
-        pos = torch.arange(seq_len, dtype=torch.float).to(self.device)
-        # 创建位置索引
-
-        inv_freq = (1.0 / (10000 ** (torch.arange(0, self.d, 2).float() / self.d))).to(self.device)
-        # 计算逆频率
-        # 在位置编码中引入多尺度信息,确保编码数值稳定性
-
-        sinusoid_inp = torch.einsum("i,d->id", pos, inv_freq)
-        # 使用爱因斯坦求和约定
-        # 生成位置编码
-
-        pos_emb = torch.cat([torch.sin(sinusoid_inp), torch.cos(sinusoid_inp)], dim=-1)
-        # 连接生成结果,三角位置计算
-
-        return pos_emb
+            self.encoders = nn.ModuleList([
+            Encoder(d, dk, head_num, use_dropout).to(device)
+            for _ in range(encoder_num)
+        ])  # 添加encoder_num个编码器
 
     def forward(self, inputs: Tensor) -> Tensor:
         """
@@ -169,16 +252,10 @@ class ViT_Transformer(nn.Module):
         - inputs: 输入序列 [batch, target_seq, model_dim]
         """
 
-        inputs = inputs.to(self.device)
-
-        sequence_len = inputs.shape[1]
-        # 获取输入张量的序列长度
-
-        inputs = inputs * self.d**0.5 + self.rope_encode(sequence_len)
-        # 将嵌入向量乘以嵌入维度的平方根(防止嵌入值过大)
-
-        attn_output = self.encoders(inputs)
-        return attn_output
+        x = inputs.to(self.device)
+        for encoder in self.encoders:
+            x = encoder(x)
+        return x
         # 注意力输出
 
 
@@ -203,6 +280,7 @@ class PatchEmbedding(nn.Module):
 
         self.pool = nn.MaxPool2d(kernel_size=2)
         # 池化层
+
     def forward(self, x: Tensor) -> Tensor:
         """
         参数:
@@ -212,7 +290,7 @@ class PatchEmbedding(nn.Module):
         x = self.conv(x)   # [embed_dim, num_patches, num_patches]
         # 通过卷积层分割图像
 
-        x = self.pool(x)   # [embed_dim, num_patches/2, num_patches/2]
+        # x = self.pool(x)   # [embed_dim, num_patches/2, num_patches/2]
         # 通过池化层减小尺寸
 
         x = x.flatten(2)   # [embed_dim, num_patches*2 / 4]
@@ -237,12 +315,12 @@ class MLP(nn.Module):
         
 
 class CNN_final(nn.Module):
-    """使用CNN代替MLP作为输出层"""
+    """使用 CNN 代替 MLP 作为输出层"""
     def __init__(self):
         super().__init__()
         pass
 
-    def forward(self) -> Tensor:
+    def forward(self) -> Tensor:   # type: ignore
         pass
 
 
